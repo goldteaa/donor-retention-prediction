@@ -1,0 +1,1290 @@
+---
+title: "Donor Retention Project"
+author: "Artea Myftiu"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = FALSE,   # hide code by default (can be unfolded)
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.width  = 7,
+  fig.height = 4
+)
+set.seed(2025)
+```
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+library(pROC)
+library(rpart)
+library(ranger)
+library(xgboost)
+library(yardstick)
+library(baguette)
+library(gt)
+```
+
+# 1. Executive Summary
+
+This project builds predictive models to estimate whether each donor will
+donate again in 2018. Using historical donation behavior from multiple
+years, we:
+
+- Construct features summarizing **recency, frequency and monetary** behavior.
+- Train several models:
+  - Logistic regression (full and forward stepwise–selected)
+  - Decision trees (default and tuned)
+  - Bagged trees
+  - Random forest
+  - Gradient boosting (XGBoost)
+- Evaluate models on a hold-out **2018 test set** using:
+  - AUC
+  - Sensitivity
+  - Specificity
+
+We then translate the best predictive model into **business impact** by
+simulating different mailing strategies (what % of donors to contact) and
+computing cost, revenue, and net profit. We also build a **lift chart**
+to show how much better the model is than a random strategy.
+
+**Key high-level findings:**
+
+- The **stepwise logistic regression** achieves the highest test AUC
+  (≈ 0.693), slightly better than the random forest and other tree-based
+  ensembles.
+- The business problem is **imbalanced but not extreme**: only about
+  20–21% of donors donate in the prediction year.
+- Targeting only the **top-scoring donors** (e.g. top 60–80%) generates
+  almost the same revenue as mailing everyone, with lower cost and
+  slightly higher net profit.
+- The model helps the charity **spend mailing budget more efficiently**
+  and suggests a move away from the naive “mail everyone” strategy.
+
+# 2. Business Problem & Data
+
+The organization wants to **predict which donors are most likely to give
+again** so that marketing mailers can be focused on high-probability
+donors. Mailing everyone is expensive and wastes budget on low-probability
+donors.
+
+We use five data files:
+
+- `donors.csv` — static donor demographics and segmentation
+- `gifts.csv` — donation history (donor, date, amount)
+- `basetable_2017.csv` — engineered features and target for 2017
+- `basetable_2018.csv` — engineered features and target for 2018 (test)
+- `feature_catalog.csv` — documentation of the engineered features
+
+## 2.1 Load Data
+
+```{r load-data}
+donors          <- read_csv("donors.csv")
+gifts           <- read_csv("gifts.csv")
+basetable_2017  <- read_csv("basetable_2017.csv")
+basetable_2018  <- read_csv("basetable_2018.csv")
+feature_catalog <- read_csv("feature_catalog.csv")
+```
+
+## 2.2 Exploratory Data Analysis
+
+We first explore the donor universe and the basetables to understand
+the size of the dataset, missing values, and donation behavior.
+
+```{r eda}
+# Donor demographics
+glimpse(donors)
+summary(donors)
+
+# Clean gifts and inspect
+gifts <- gifts %>%
+  mutate(
+    donor_id = as.integer(id),
+    date     = as.Date(date)
+  )
+
+glimpse(gifts)
+summary(gifts)
+
+# Date range of donations and number of unique donors
+date_range <- range(gifts$date, na.rm = TRUE)
+unique_donors <- length(unique(gifts$donor_id))
+
+date_range
+unique_donors
+
+# Basetables
+glimpse(basetable_2017)
+glimpse(basetable_2018)
+
+summary(basetable_2017$target_donated)
+summary(basetable_2018$target_donated)
+
+na_2017 <- colSums(is.na(basetable_2017))
+na_2018 <- colSums(is.na(basetable_2018))
+
+na_2017
+na_2018
+
+head(feature_catalog)
+```
+
+### 2.3 Question 1: Data Understanding
+
+**a) What is the date range of the donation history? How many years of data are available?**  
+From the gifts data, the donation dates range from **2012-01-01** to
+**2018-12-31**, which is roughly **7 years** of donation history.
+
+**b) What percentage of donors have missing demographic information (age, gender, location)?**  
+In our basetables, the key demographic fields (`age`, `gender`,
+`country`, `region`, `segment`) have **0 missing values**, so the
+percentage of donors with missing demographic information is effectively
+**0%**.
+
+**c) Overall donation response rate across all historical campaigns**  
+In `basetable_2017`, the mean of `target_donated` ≈ **0.212**  
+In `basetable_2018`, the mean of `target_donated` ≈ **0.204**  
+
+So the overall response rate is around **20–21%**, meaning **most donors
+do not donate in the prediction window**. This confirms that the
+business problem is a **moderately imbalanced classification problem**
+where we care about lifting the probability of donation above this
+baseline.
+
+**d) Data quality issues before modeling**  
+
+- **Missing values:** `avg_days_between` has some NAs (12 in 2017, 6 in
+  2018) that need to be imputed.
+- **Imbalanced target:** Only ~20% positive cases; evaluation metrics
+  should emphasize AUC and lift rather than accuracy alone.
+- **Monetary outliers:** Donation amounts vary widely; a few very large
+  gifts may influence models if not handled carefully.
+- **Zero recent activity but non-zero lifetime:** Many donors have no
+  donations in the recent 12-month window but older lifetime donations –
+  this is meaningful but should be checked for consistency.
+
+# 3. Data Preparation
+
+We clean a few variables and make sure categorical variables are treated
+as factors.
+
+```{r prep}
+# Fix avg_days_between NAs by median imputation
+for (df_name in c("basetable_2017", "basetable_2018")) {
+  df <- get(df_name)
+  if ("avg_days_between" %in% names(df)) {
+    med_val <- median(df$avg_days_between, na.rm = TRUE)
+    df$avg_days_between[is.na(df$avg_days_between)] <- med_val
+  }
+  assign(df_name, df)
+}
+
+# Ensure categorical variables are factors (if they exist)
+cat_vars <- intersect(
+  c("gender", "country", "region", "segment"),
+  names(basetable_2017)
+)
+
+basetable_2017 <- basetable_2017 %>%
+  mutate(across(all_of(cat_vars), as.factor))
+
+basetable_2018 <- basetable_2018 %>%
+  mutate(across(all_of(cat_vars), as.factor))
+```
+
+### 3.1 Conceptual Questions on Windows & Population
+
+> These questions relate to the general course framework (observation
+> dates, lookback/prediction windows, population selection), not only
+> this specific dataset.
+
+#### 3.1.1 Observation Dates & Windows
+
+**a) Why choose quarterly observation dates vs monthly or annual?**  
+Quarterly observation dates are a **compromise**:
+
+- Compared to **annual**, they give **more training examples** and
+  capture shorter-term behavior changes.
+- Compared to **monthly**, they avoid producing too many highly
+  correlated samples and reduce computation.  
+Overall, quarterly points capture dynamics without exploding the number
+of rows.
+
+**b) Why must the 365-day lookback not overlap with the 90-day prediction window?**  
+If the windows overlap, features would use information from the **future
+relative to the prediction** – this is a **timeline violation / data
+leakage**. The model would then look artificially good in evaluation but
+perform poorly in production.
+
+**c) Timeline diagram (conceptual)**  
+
+For an observation date of 2023-07-01:
+
+- Lookback window: **2022-07-02 to 2023-07-01** (365 days)
+- Observation date: **2023-07-01** (vertical line)
+- Prediction window: **2023-07-02 to 2023-09-30** (next 90 days)
+
+All features are computed using data **strictly before** the observation
+date; the target is whether a donation occurs **strictly after** it.
+
+**d) Number of observation points and training examples**  
+If we pick, for example, **4 quarterly observation dates per year** over
+**2 years**, that gives **8 observation points**.  
+If each yields **10,000 eligible donors**, we get about  
+**8 × 10,000 = 80,000** training examples.
+
+#### 3.1.2 Population Selection
+
+**a) Why require at least one donation in the lookback window?**  
+We want to model **retention** of active donors. Requiring at least one
+donation ensures we exclude people with **no recent activity** (cold
+leads). This focuses the model on donors where mailing decisions are
+most relevant.
+
+**b) 8,000 eligible donors vs 50,000 total**  
+The missing 42,000 donors are:
+
+- New donors with **no history in the lookback window**
+- Dormant donors whose last donation is too old
+- Donors filtered out by business rules  
+
+This is expected and not necessarily bad, as long as the definition of
+“eligible” matches the business goal.
+
+**c) Timeline compliance**  
+“Timeline compliant” means **no feature uses information from the
+future** relative to the observation date.
+
+Example violation: using a **lifetime donation total computed as of
+2024-01-01** to predict behavior for an observation date in 2023. This
+includes data from **after** the observation point and would leak
+future information into the model.
+
+#### 3.1.3 Target Definition
+
+**a) 9.5% response rate – balanced or imbalanced?**  
+A response rate of **9.5%** is **clearly imbalanced** (far more
+non-donors than donors). This implies we should:
+
+- Focus on **AUC, PR curves, and lift**, rather than accuracy.
+- Consider models that handle imbalance better (e.g., tree ensembles).
+- Be careful with decision thresholds (0.5 may not be optimal).
+
+**b) Why must prediction window start after the observation date?**  
+If the prediction window includes the observation date, we risk counting
+donations that were already known at the time of prediction, again
+causing **data leakage**. The target must reflect **future behavior**,
+not current or past events.
+
+#### 3.1.4 Feature Engineering (RFM etc.)
+
+**a) Intuition behind RFM components**
+
+- **Recency:** Donors who gave **recently** are much more likely to give
+  again soon; long gaps usually mean engagement is fading.
+- **Frequency:** Donors who give **often** show strong engagement and are
+  more likely to respond again.
+- **Monetary:** Donors who give **larger amounts** often care more or
+  have higher capacity to give; they tend to be higher-value targets.
+
+**b) Why multiple time windows (30, 90, 180, 365 days)?**  
+
+Different windows capture **different patterns**:
+
+- 30 days: very **short-term spikes** or campaign responses
+- 90 days: **recent engagement** (quarterly behavior)
+- 180 days: medium-term consistency
+- 365 days: **overall annual activity**
+
+Some donors give only once per year; others give frequently in bursts.
+Multiple windows let the model distinguish these.
+
+**c) Trend indicator formula and interpretation**  
+
+A simple trend measure is:
+
+Trend = (donations last 90 days − donations 91–365 days ago) /
+        (donations 91–365 days ago + ε)
+
+
+
+- **Positive** trend: activity is **increasing** recently.
+- **Negative** trend: donor was more active in the **past** than
+  recently (possible churn).
+
+**d) Three additional useful features**
+
+- **Channel mix** (e.g., share of online vs offline gifts) – donors who
+  use convenient channels may respond better to certain campaigns.
+- **Time since first donation** – distinguishes **very new** donors from
+  long-time loyal donors.
+- **Number of distinct years with a donation** – measures **loyalty over
+  time**, not just recent frequency.
+
+#### 3.1.5 Basetable Quality Control
+
+**a) Code to check basic basetable quality**
+
+Conceptually, we want to ensure no feature uses dates after the
+observation date or inside the prediction window. In this dataset,
+features are already pre-computed, so we mainly check:
+
+```{r basetable-qc}
+# Example QC summary
+
+nrows_2017 <- nrow(basetable_2017)
+nrows_2018 <- nrow(basetable_2018)
+
+unique_donors_2017 <- n_distinct(basetable_2017$donor_id)
+unique_donors_2018 <- n_distinct(basetable_2018$donor_id)
+
+nrows_2017
+nrows_2018
+unique_donors_2017
+unique_donors_2018
+
+# Target distribution
+prop.table(table(basetable_2017$target_donated))
+prop.table(table(basetable_2018$target_donated))
+
+# Missing value percentages
+missing_pct_2017 <- colSums(is.na(basetable_2017)) / nrow(basetable_2017)
+missing_pct_2018 <- colSums(is.na(basetable_2018)) / nrow(basetable_2018)
+
+missing_pct_2017
+missing_pct_2018
+```
+
+**b) Descriptive statistics for basetable**
+
+- `basetable_2017`:
+  - Rows: **900** donor-observation pairs
+  - Unique donors: **900**
+  - Observation dates: pre-aggregated (one row per donor)
+  - Target positive rate (`target_donated`): ≈ **21.2%**
+
+- `basetable_2018`:
+  - Rows: **651** donor-observation pairs
+  - Unique donors: **651**
+  - Target positive rate: ≈ **20.4%**
+
+Missing values:
+
+- Most features have **0% missing**.
+- `avg_days_between` had some NAs, which we imputed with the median.
+
+**c) 15% missing email_open_rate – why and what to do?**
+
+- **Why:** Some donors may never have been emailed, or email tracking
+  wasn’t available earlier → missing by design / not measured.
+- **Two strategies:**
+  1. Create a **“missing” category / flag** to let the model learn if
+     “no email data” itself is informative.
+  2. Impute using **group-based averages** (e.g., by segment, country)
+     and track a separate indicator that the value was imputed.
+
+# 4. Logistic Regression Models
+
+We first build logistic regression models on the 2017 basetable. The
+goal is to predict `target_donated` (donated again next year).
+
+## 4.1 Full Logistic Model
+
+```{r logit-full}
+# Split 2017 into train/validation
+set.seed(2025)
+n_2017    <- nrow(basetable_2017)
+train_idx <- sample(seq_len(n_2017), size = floor(0.75 * n_2017))
+
+train_2017 <- basetable_2017[train_idx, ]
+valid_2017 <- basetable_2017[-train_idx, ]
+
+# Full formula: all predictors except donor_id & target_amount
+full_formula <- as.formula("target_donated ~ . - donor_id - target_amount")
+
+logit_full <- glm(
+  full_formula,
+  data   = train_2017,
+  family = binomial
+)
+
+summary(logit_full)
+
+valid_probs_full <- predict(logit_full, newdata = valid_2017, type = "response")
+roc_full         <- roc(valid_2017$target_donated, valid_probs_full)
+auc_full         <- auc(roc_full)
+auc_full
+```
+
+## 4.2 Forward Stepwise Selection (AUC-based)
+
+```{r logit-stepwise}
+forward_stepwise_auc <- function(
+    candidate_vars,
+    data_train,
+    data_valid,
+    target  = "target_donated",
+    max_vars = 10
+) {
+  selected_vars  <- character(0)
+  remaining_vars <- candidate_vars
+  best_auc       <- 0.5
+  history <- tibble(
+    step           = integer(),
+    variable_added = character(),
+    auc            = numeric()
+  )
+
+  for (step in seq_len(max_vars)) {
+    step_results <- map_dfr(remaining_vars, function(v) {
+      vars_try <- c(selected_vars, v)
+      f <- as.formula(
+        paste(target, "~", paste(vars_try, collapse = " + "))
+      )
+      fit   <- glm(f, data = data_train, family = binomial)
+      preds <- predict(fit, newdata = data_valid, type = "response")
+      r <- tryCatch(roc(data_valid[[target]], preds), error = function(e) NA)
+      auc_val <- if (any(is.na(r))) NA_real_ else as.numeric(auc(r))
+      tibble(variable = v, auc = auc_val)
+    })
+
+    step_results <- step_results %>%
+      filter(!is.na(auc))
+
+    if (nrow(step_results) == 0) break
+
+    best_idx  <- which.max(step_results$auc)
+    best_step <- step_results[best_idx, , drop = FALSE]
+
+    if (best_step$auc <= best_auc + 1e-4) {
+      break
+    }
+
+    best_auc <- best_step$auc
+    best_var <- best_step$variable
+    selected_vars  <- c(selected_vars, best_var)
+    remaining_vars <- setdiff(remaining_vars, best_var)
+
+    history <- history %>%
+      add_row(
+        step           = step,
+        variable_added = best_var,
+        auc            = best_auc
+      )
+  }
+
+  list(
+    selected_vars       = selected_vars,
+    performance_history = history
+  )
+}
+
+candidate_vars <- setdiff(
+  names(train_2017),
+  c("donor_id", "target_amount", "target_donated")
+)
+
+fs_result <- forward_stepwise_auc(
+  candidate_vars = candidate_vars,
+  data_train     = train_2017,
+  data_valid     = valid_2017,
+  target         = "target_donated",
+  max_vars       = 10
+)
+
+fs_result$selected_vars
+fs_result$performance_history
+
+# Fit selected logistic model
+if (length(fs_result$selected_vars) > 0) {
+  selected_formula <- as.formula(
+    paste("target_donated ~", paste(fs_result$selected_vars, collapse = " + "))
+  )
+  logit_selected <- glm(
+    selected_formula,
+    data   = train_2017,
+    family = binomial
+  )
+
+  valid_probs_sel <- predict(logit_selected, newdata = valid_2017, type = "response")
+  roc_sel         <- roc(valid_2017$target_donated, valid_probs_sel)
+  auc_sel         <- auc(roc_sel)
+  auc_sel
+} else {
+  logit_selected <- NULL
+  auc_sel        <- NA_real_
+}
+```
+
+### 4.3 Logistic Model Interpretation & Variable Selection
+
+
+- Full logistic validation AUC ≈ **0.564**
+- Stepwise logistic validation AUC ≈ **0.615**
+- On 2018 test set:
+  - Full logistic AUC ≈ **0.669**
+  - Selected logistic AUC ≈ **0.693**
+
+#### Question 3.1: Initial Model Interpretation
+
+**a)** AUC of the full logistic model on the test set is ≈ **0.669**.  
+According to the guideline (0.7 acceptable, 0.8 good), this is just
+below the “acceptable” threshold, so performance is **moderate but not
+strong**.
+
+**b)** The variables with the largest **positive** coefficients (in
+magnitude) include things like:
+
+- Being in higher value **segments** (e.g., Gold / Silver)
+- Higher **recent monetary totals**
+- Higher **recent frequencies**
+
+These indicate donors who give more often and/or larger amounts are more
+likely to give again.
+
+The variables with the largest **negative** coefficients include:
+
+- Very long **recency** (larger days since last donation)
+- Some combinations of low frequency and low monetary amounts
+- Features indicating low or declining engagement  
+
+In short: **recent, frequent and higher monetary donors** are predicted
+to respond again; donors with long inactivity are less likely.
+
+**c)** McFadden’s pseudo \(R^2\) is usually relatively low for logistic
+models in marketing; a value around, say, 0.1–0.2 means the model
+explains **a modest but meaningful share** of the variation in donation
+behavior. It confirms that **donor behavior is noisy**, and even good
+models will not be perfectly predictive.
+
+#### Question 3.2: Variable Selection (Forward Stepwise)
+
+**a)** The first selected variable was **`monetary_max_12m`**.  
+This makes sense: donors who had at least one **large gift in the last
+year** are strongly indicative of both capacity and engagement.
+
+**b)** As we add variables, the AUC improves at first (e.g., 0.586,
+0.602, 0.609, 0.613, 0.615). After a few steps, the AUC gain from
+adding more variables becomes **very small** (diminishing returns after
+~5 variables).
+
+**c)** The stepwise model uses **far fewer variables** than the full
+model (e.g., 5–7 vs ~25) but achieves **better AUC** on the test set
+(0.693 vs 0.669). This illustrates the **bias–variance tradeoff**: a
+simpler model with the strongest predictors can generalize better and
+avoid overfitting noise in the full model.
+
+# 5. Tree-Based Models (tidymodels)
+
+We now move to tree-based models using tidymodels: a single decision
+tree, tuned tree, bagging, random forest, and gradient boosting.
+
+## 5.1 Prepare Data and Resampling
+
+```{r trees-prep}
+data_2017 <- basetable_2017 %>%
+  mutate(
+    target = factor(if_else(target_donated == 1, "yes", "no"))
+  )
+
+data_2018 <- basetable_2018 %>%
+  mutate(
+    target = factor(if_else(target_donated == 1, "yes", "no"))
+  )
+
+set.seed(2025)
+data_split <- initial_split(data_2017, prop = 0.75, strata = target)
+train_tree <- training(data_split)
+valid_tree <- testing(data_split)
+test_tree  <- data_2018
+
+tree_rec <- recipe(target ~ ., data = train_tree) %>%
+  update_role(donor_id, target_donated, target_amount, new_role = "ID") %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+set.seed(2025)
+cv_folds <- vfold_cv(train_tree, v = 5, strata = target)
+```
+
+## 5.2 Single Decision Tree
+
+```{r tree-single}
+tree_spec <- decision_tree(
+  mode           = "classification",
+  cost_complexity = 0.01,
+  tree_depth      = 10,
+  min_n           = 20
+) %>%
+  set_engine("rpart")
+
+tree_wf <- workflow() %>%
+  add_model(tree_spec) %>%
+  add_recipe(tree_rec)
+
+tree_fit <- tree_wf %>%
+  fit(data = train_tree)
+
+tree_pred_test <- predict(tree_fit, new_data = test_tree, type = "prob")
+
+tree_auc_test <- auc(
+  roc(
+    as.numeric(test_tree$target == "yes"),
+    tree_pred_test$.pred_yes
+  )
+)
+tree_auc_test
+```
+
+## 5.3 Tuned Decision Tree
+
+```{r tree-tuned}
+tree_tune_spec <- decision_tree(
+  mode           = "classification",
+  cost_complexity = tune(),
+  tree_depth      = tune(),
+  min_n           = tune()
+) %>%
+  set_engine("rpart")
+
+tree_grid <- grid_regular(
+  cost_complexity(),
+  tree_depth(range = c(3L, 15L)),
+  min_n(range = c(5L, 50L)),
+  levels = 4
+)
+
+tree_tune_wf <- workflow() %>%
+  add_model(tree_tune_spec) %>%
+  add_recipe(tree_rec)
+
+set.seed(2025)
+tree_tune_res <- tune_grid(
+  tree_tune_wf,
+  resamples = cv_folds,
+  grid      = tree_grid,
+  metrics   = metric_set(roc_auc)
+)
+
+best_tree_params <- select_best(tree_tune_res, metric = "roc_auc")
+best_tree_params
+
+best_tree_wf <- finalize_workflow(tree_tune_wf, best_tree_params) %>%
+  fit(data = train_tree)
+
+best_tree_pred_test <- predict(best_tree_wf, new_data = test_tree, type = "prob")
+
+best_tree_auc_test <- auc(
+  roc(
+    as.numeric(test_tree$target == "yes"),
+    best_tree_pred_test$.pred_yes
+  )
+)
+best_tree_auc_test
+```
+
+## 5.4 Bagging (Bagged Trees)
+
+```{r bagging}
+bag_spec <- bag_tree(
+  mode           = "classification",
+  cost_complexity = 0.01,
+  tree_depth      = 15,
+  min_n           = 10
+) %>%
+  set_engine("rpart", times = 50)
+
+bag_wf <- workflow() %>%
+  add_model(bag_spec) %>%
+  add_recipe(tree_rec)
+
+bag_fit <- bag_wf %>%
+  fit(data = train_tree)
+
+bag_pred_test <- predict(bag_fit, new_data = test_tree, type = "prob")
+
+bag_auc_test <- auc(
+  roc(
+    as.numeric(test_tree$target == "yes"),
+    bag_pred_test$.pred_yes
+  )
+)
+bag_auc_test
+```
+
+## 5.5 Random Forest
+
+```{r rf}
+rf_tune_spec <- rand_forest(
+  mode  = "classification",
+  mtry  = tune(),
+  trees = 500,
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity")
+
+# Rough upper bound for mtry
+p_train <- ncol(model.matrix(target ~ ., data = train_tree)) - 1
+
+rf_grid <- grid_regular(
+  mtry(range = c(5L, min(20L, p_train))),
+  min_n(range = c(5L, 50L)),
+  levels = 4
+)
+
+rf_wf <- workflow() %>%
+  add_model(rf_tune_spec) %>%
+  add_recipe(tree_rec)
+
+set.seed(2025)
+rf_tune_res <- tune_grid(
+  rf_wf,
+  resamples = cv_folds,
+  grid      = rf_grid,
+  metrics   = metric_set(roc_auc)
+)
+
+best_rf_params <- select_best(rf_tune_res, metric = "roc_auc")
+best_rf_params
+
+best_rf_wf <- finalize_workflow(rf_wf, best_rf_params) %>%
+  fit(data = train_tree)
+
+rf_pred_test <- predict(best_rf_wf, new_data = test_tree, type = "prob")
+
+rf_auc_test <- auc(
+  roc(
+    as.numeric(test_tree$target == "yes"),
+    rf_pred_test$.pred_yes
+  )
+)
+rf_auc_test
+
+# Variable importance
+rf_fit_obj <- extract_fit_parsnip(best_rf_wf)$fit
+rf_varimp <- as.data.frame(rf_fit_obj$variable.importance) %>%
+  rownames_to_column("variable") %>%
+  rename(importance = 2) %>%
+  arrange(desc(importance))
+
+rf_varimp_top15 <- head(rf_varimp, 15)
+
+rf_varimp_top15
+
+rf_varimp_top15 %>%
+  ggplot(aes(x = reorder(variable, importance), y = importance)) +
+  geom_col() +
+  coord_flip() +
+  ggtitle("Top 15 Variable Importance - Random Forest") +
+  xlab("Variable") + ylab("Importance")
+```
+
+## 5.6 Gradient Boosting (XGBoost)
+
+```{r xgb}
+boost_tune_spec <- boost_tree(
+  mode       = "classification",
+  trees      = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n      = tune()
+) %>%
+  set_engine("xgboost")
+
+boost_grid <- grid_latin_hypercube(
+  trees(range = c(100L, 700L)),
+  tree_depth(range = c(3L, 8L)),
+  learn_rate(range = c(0.01, 0.3)),
+  min_n(range = c(5L, 50L)),
+  size = 20
+)
+
+boost_wf <- workflow() %>%
+  add_model(boost_tune_spec) %>%
+  add_recipe(tree_rec)
+
+set.seed(2025)
+boost_tune_res <- tune_grid(
+  boost_wf,
+  resamples = cv_folds,
+  grid      = boost_grid,
+  metrics   = metric_set(roc_auc)
+)
+
+best_boost_params <- select_best(boost_tune_res, metric = "roc_auc")
+best_boost_params
+
+best_boost_wf <- finalize_workflow(boost_wf, best_boost_params) %>%
+  fit(data = train_tree)
+
+boost_pred_test <- predict(best_boost_wf, new_data = test_tree, type = "prob")
+
+boost_auc_test <- auc(
+  roc(
+    as.numeric(test_tree$target == "yes"),
+    boost_pred_test$.pred_yes
+  )
+)
+boost_auc_test
+```
+
+### 5.7 Tree & Ensemble Questions
+
+
+- Single decision tree AUC (2018 test): **0.618**
+- Tuned decision tree AUC: **0.545**
+- Bagged trees AUC: **0.614**
+- Random forest AUC: **0.660**
+- Gradient boosting AUC: **0.563**
+
+#### Question 4.1: Decision Tree Analysis
+
+**a)** The single decision tree AUC (~**0.618**) is **better than the
+logistic full validation AUC (0.564)** but **worse than the stepwise
+logistic test AUC (0.693)**. So the tree is reasonable but not the best.
+
+**b)** The root split typically uses a strong RFM-type variable (e.g.,
+`recency_days_12m` or `monetary_total_24m`). This aligns with the
+logistic findings that recent and higher monetary donors are more likely
+to give again.
+
+#### Question 4.2: Hyperparameter Tuning Insights
+
+**a)** Optimal tree hyperparameters:  
+`cost_complexity = 0.0000000001`, `tree_depth = 15`, `min_n = 5`.  
+This indicates the best tree is **deep and complex**, with very small
+pruning, effectively close to a fully grown tree.
+
+**b)** Tuning actually **hurt** performance vs the default tree  
+(0.545 vs 0.618), suggesting the tuned tree overfits more. This shows
+that a single tree is quite unstable; small tuning choices can make it
+overfit.
+
+#### Question 4.3: Bagging Performance
+
+**a)** Bagged trees AUC (~**0.614**) is **similar to but slightly below**
+the single default tree (0.618) and below random forest (0.660).
+
+**b)** Bagging reduces **variance** by averaging many bootstrapped
+trees, making predictions more stable and typically improving
+generalization over a single tree, especially when the base tree is
+high-variance.
+
+#### Question 4.4: Random Forest Analysis
+
+**a)** Optimal `mtry` is **5**, which is small relative to the total
+number of features after dummying. This means each split only sees a
+small random subset of predictors, giving **strong feature
+randomization** and decorrelating the trees.
+
+**b)** Random forest AUC (~**0.660**) is **better than bagging (0.614)**
+and close to the full logistic (0.669), but still slightly below the
+selected logistic (0.693).
+
+**c)** The top variable importance features largely overlap with the
+stepwise logistic selection: recency, frequency, monetary amounts, and
+segment/country. Some differences appear where the forest can exploit
+non-linear interactions and may elevate variables that combine well in
+splits.
+
+#### Question 4.5: Gradient Boosting Performance
+
+**a)** 
+:  
+`trees = 592`, `tree_depth = 6`, `learn_rate ≈ 0.17`, `min_n = 36`.
+
+**b)** Boosted model AUC (~**0.563**) is **lower** than most other
+models and is not the best performer here.
+
+**c)** The learning rate (~0.17) is on the **larger side** compared to
+very small values (<0.05). A larger learning rate means **fewer trees**
+are needed but increases risk of overfitting. In this setting, boosting
+did not outperform the simpler models.
+
+# 6. Refit Logistic Models on Full 2017 and Test on 2018
+
+We now refit the logistic models on the **full 2017 basetable** and
+evaluate directly on 2018.
+
+```{r logit-refit}
+logit_full_all <- glm(
+  full_formula,
+  data   = basetable_2017,
+  family = binomial
+)
+
+test_probs_full <- predict(
+  logit_full_all,
+  newdata = basetable_2018,
+  type    = "response"
+)
+
+logit_full_auc_test <- auc(
+  roc(
+    basetable_2018$target_donated,
+    test_probs_full
+  )
+)
+logit_full_auc_test
+
+if (!is.null(logit_selected) && length(fs_result$selected_vars) > 0) {
+  selected_formula_all <- as.formula(
+    paste("target_donated ~", paste(fs_result$selected_vars, collapse = " + "))
+  )
+  logit_sel_all <- glm(
+    selected_formula_all,
+    data   = basetable_2017,
+    family = binomial
+  )
+
+  test_probs_sel <- predict(
+    logit_sel_all,
+    newdata = basetable_2018,
+    type    = "response"
+  )
+
+  logit_sel_auc_test <- auc(
+    roc(
+      basetable_2018$target_donated,
+      test_probs_sel
+    )
+  )
+  logit_sel_auc_test
+} else {
+  logit_sel_all      <- NULL
+  test_probs_sel     <- rep(NA_real_, nrow(basetable_2018))
+  logit_sel_auc_test <- NA_real_
+}
+```
+
+# 7. Model Comparison (2018 Test Set)
+
+We compare all models on the 2018 test set using AUC, sensitivity and
+specificity at the 0.5 threshold.
+
+```{r comparison}
+compute_metrics <- function(truth_num, preds_prob, model_name) {
+  truth_fac <- factor(if_else(truth_num == 1, "yes", "no"),
+                      levels = c("no", "yes"))
+
+  if (all(is.na(preds_prob))) {
+    return(tibble(
+      model       = model_name,
+      auc         = NA_real_,
+      sensitivity = NA_real_,
+      specificity = NA_real_
+    ))
+  }
+
+  # AUC
+  auc_val <- as.numeric(auc(roc(truth_num, preds_prob)))
+
+  # Class predictions at 0.5 threshold
+  class_pred <- factor(if_else(preds_prob >= 0.5, "yes", "no"),
+                       levels = c("no", "yes"))
+
+  # Build data frame for yardstick
+  df_metrics <- tibble(
+    truth    = truth_fac,
+    estimate = class_pred
+  )
+
+  # Sensitivity & specificity
+  sens_val <- sensitivity(df_metrics, truth, estimate,
+                          event_level = "second")$.estimate
+  spec_val <- specificity(df_metrics, truth, estimate,
+                          event_level = "second")$.estimate
+
+  tibble(
+    model       = model_name,
+    auc         = auc_val,
+    sensitivity = sens_val,
+    specificity = spec_val
+  )
+}
+
+test_truth_num <- basetable_2018$target_donated
+
+comparison_table <- bind_rows(
+  compute_metrics(test_truth_num, test_probs_full,               "Logistic_Full"),
+  compute_metrics(test_truth_num, test_probs_sel,                "Logistic_Selected"),
+  compute_metrics(test_truth_num, tree_pred_test$.pred_yes,      "Decision_Tree_Default"),
+  compute_metrics(test_truth_num, best_tree_pred_test$.pred_yes, "Decision_Tree_Tuned"),
+  compute_metrics(test_truth_num, bag_pred_test$.pred_yes,       "Bagged_Trees"),
+  compute_metrics(test_truth_num, rf_pred_test$.pred_yes,        "Random_Forest"),
+  compute_metrics(test_truth_num, boost_pred_test$.pred_yes,     "Gradient_Boosting")
+)
+
+comparison_table
+
+knitr::kable(
+  comparison_table,
+  caption = "Model performance on the 2018 test set",
+  digits  = 3
+)
+```
+
+
+- Logistic_Full: AUC 0.669, Sens 0.023, Spec 0.990
+- Logistic_Selected: AUC 0.693, Sens 0.008, Spec 1.000
+- Decision_Tree_Default: AUC 0.618, Sens 0.060, Spec 0.956
+- Decision_Tree_Tuned: AUC 0.545, Sens 0.301, Spec 0.732
+- Bagged_Trees: AUC 0.614, Sens 0.030, Spec 0.985
+- Random_Forest: AUC 0.660, Sens 0.030, Spec 1.000
+- Gradient_Boosting: AUC 0.563, Sens 0.165, Spec 0.892
+
+### 7.1 Question 5.1: Model Selection Decision
+
+**a) Comprehensive table**  
+See the comparison table above (AUC, sensitivity, specificity). Training
+time is highest for random forest and boosting; interpretability is
+highest for logistic regression and single trees.
+
+**b)** The **Selected Logistic** model achieves the highest test AUC
+(~0.693). Given its:
+
+- Strong performance
+- Good interpretability (only a few variables)
+- Simpler implementation
+
+it is a very reasonable choice for deployment, even though random forest
+is competitive.
+
+**c)** A 0.02 AUC difference (e.g. 0.84 vs 0.82) is **modest**. Whether
+it is practically significant depends on:
+
+- The number of mailings and budget size
+- The value of each extra correctly targeted donor  
+
+We would likely compare **profit curves** for both models; if the more
+complex model only adds a tiny amount of profit, the extra complexity
+may not be worth it.
+
+**d)** CFO question: “Why not just use the simple 7-variable logistic instead of a 25-variable random forest?”  
+
+Balanced answer:
+
+- **For logistic:**
+  - Pros: more **interpretable**, easier to explain, faster to run,
+    simpler to maintain.
+  - Cons: may miss non-linear interactions and may have slightly lower
+    AUC.
+
+- **For random forest:**
+  - Pros: often slightly **better predictive performance**, captures
+    complex interactions.
+  - Cons: “black box”, heavier to run, harder to justify to regulators
+    or leadership.
+
+A practical approach: **start with the simpler logistic model** and
+evaluate whether the extra complexity of random forest provides enough
+additional profit to justify the overhead.
+
+# 8. Business Impact and Lift
+
+We now translate model performance into business terms: expected profit
+for different contact rates, and lift curves.
+
+```{r business}
+# Clean out NA AUCs and pick best model by AUC
+comparison_clean <- comparison_table %>%
+  filter(!is.na(auc))
+
+if (nrow(comparison_clean) == 0) {
+  stop("No valid models with non-NA AUC.")
+}
+
+best_model_row  <- comparison_clean[order(-comparison_clean$auc), ][1, , drop = FALSE]
+best_model_row
+best_model_name <- best_model_row$model[1]
+best_model_name
+
+best_probs <- dplyr::case_when(
+  best_model_name == "Logistic_Full"         ~ test_probs_full,
+  best_model_name == "Logistic_Selected"     ~ test_probs_sel,
+  best_model_name == "Decision_Tree_Default" ~ tree_pred_test$.pred_yes,
+  best_model_name == "Decision_Tree_Tuned"   ~ best_tree_pred_test$.pred_yes,
+  best_model_name == "Bagged_Trees"          ~ bag_pred_test$.pred_yes,
+  best_model_name == "Random_Forest"         ~ rf_pred_test$.pred_yes,
+  best_model_name == "Gradient_Boosting"     ~ boost_pred_test$.pred_yes,
+  TRUE                                       ~ test_probs_full
+)
+
+business_df <- tibble(
+  donor_id = basetable_2018$donor_id,
+  donated  = basetable_2018$target_donated,
+  score    = best_probs
+) %>%
+  arrange(desc(score)) %>%
+  mutate(
+    rank   = row_number(),
+    decile = ntile(rank, 10)
+  )
+
+# Business parameters
+cost_per_mailing  <- 2.50
+average_donation  <- 75
+
+current_n_donors  <- nrow(business_df)
+current_n_donated <- sum(business_df$donated == 1)
+
+current_total_cost    <- current_n_donors * cost_per_mailing
+current_total_revenue <- current_n_donated * average_donation
+current_net_profit    <- current_total_revenue - current_total_cost
+
+current_n_donors
+current_n_donated
+current_total_cost
+current_total_revenue
+current_net_profit
+```
+
+
+- Donors mailed (mail everyone): **651**
+- Donations: **133**
+- Cost: **1,627.5**
+- Revenue: **9,975**
+- Net profit: **8,347.5**
+
+```{r business-strategies}
+# Try different contact percentages
+threshold_grid <- seq(0.1, 1.0, by = 0.1)
+
+strategy_results <- map_dfr(threshold_grid, function(pct) {
+  n_contact <- floor(pct * current_n_donors)
+  chosen    <- head(business_df, n_contact)
+  cost      <- n_contact * cost_per_mailing
+  revenue   <- sum(chosen$donated == 1) * average_donation
+  net       <- revenue - cost
+  tibble(
+    contact_pct = pct,
+    n_contact   = n_contact,
+    cost        = cost,
+    revenue     = revenue,
+    net_profit  = net
+  )
+})
+
+strategy_results
+
+strategy_results %>%
+  ggplot(aes(x = contact_pct * 100, y = net_profit)) +
+  geom_line() +
+  geom_point() +
+  ggtitle("Net Profit vs % of Donors Contacted (Best Model)") +
+  xlab("% of donors contacted") +
+  ylab("Net profit")
+```
+
+```{r lift}
+# Lift chart by decile
+lift_df <- business_df %>%
+  mutate(donated_flag = donated == 1) %>%
+  group_by(decile) %>%
+  summarise(
+    n         = n(),
+    positives = sum(donated_flag),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    cum_n            = cumsum(n),
+    cum_positives    = cumsum(positives),
+    baseline_rate    = sum(positives) / sum(n),
+    baseline_cum_pos = baseline_rate * cum_n,
+    lift             = cum_positives / baseline_cum_pos
+  )
+
+lift_df
+
+lift_df %>%
+  ggplot(aes(x = decile, y = cum_positives)) +
+  geom_line() +
+  geom_line(aes(y = baseline_cum_pos), linetype = "dashed") +
+  ggtitle("Lift Chart - Cumulative Responders by Decile") +
+  xlab("Decile (1 = highest scores)") +
+  ylab("Cumulative responders")
+
+lift_df %>%
+  ggplot(aes(x = decile, y = lift)) +
+  geom_col() +
+  ggtitle("Lift by Decile - Best Model") +
+  xlab("Decile (1 = highest scores)") +
+  ylab("Lift")
+```
+
+### 8.1 Question 5.2: Business Recommendations
+
+**a) “Mail everyone” strategy (from above)**
+
+- Total mailing cost: **1,627.50**
+- Total expected revenue: **9,975**
+- Net profit: **8,347.50**
+- Cost per acquired donation ≈ **1,627.5 / 133 ≈ 12.2** currency units
+  per donation.
+
+**b) Optimal strategy using best model**  
+
+From `strategy_results`, net profit is near its maximum when contacting
+around **60–90%** of donors (e.g., 0.6–0.9 contact_pct). A reasonable
+choice is to contact **top 70–80%** of donors by score, which:
+
+- Slightly reduces cost vs mailing everyone.
+- Preserves almost all revenue (most responders are in top deciles).
+- Maintains or slightly improves net profit.
+
+**c) Lift chart**  
+
+The lift chart shows that:
+
+- The **top decile** captures roughly **1.8×** the responders compared
+  to a random selection.
+- The curve gradually approaches the baseline line by decile 10, where
+  lift = 1.  
+
+This confirms that the model is effectively ranking donors by
+propensity.
+
+**d) Marketing director’s concern: “Not contacting some donors hurts long-term relationships.”**  
+
+This is a valid concern. Possible responses:
+
+- The model can be used not as a hard exclusion, but to **prioritize**
+  higher-value channels (e.g., physical mail) and use **cheaper channels
+  (email/SMS)** for low-scoring donors.
+- We can monitor **long-term engagement** and re-activate lower-scoring
+  donors periodically with lower-cost campaigns.
+- Further analysis could compare long-term giving of contacted vs
+  non-contacted donors to see if there is any negative relationship
+  impact.
+
+**e) Executive summary (business language)**  
+
+> Using seven years of donation data, we built predictive models to
+> identify which donors are most likely to donate again in 2018. Our
+> best model, a streamlined logistic regression with a handful of
+> behavior-based features, achieves an AUC of about 0.69 and clearly
+> separates higher-probability donors from the rest. By targeting only
+> the top 70–80% of donors ranked by this model, the organization can
+> maintain almost all of its revenue while reducing mailing costs and
+> slightly increasing net profit relative to the current “mail everyone”
+> strategy. We recommend adopting this data-driven targeting
+> approach for the next campaign, starting with a pilot, and using
+> lower-cost channels to stay in touch with lower-scoring donors. This
+> balances financial efficiency with long-term donor relationship
+> management.
