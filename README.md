@@ -14,6 +14,16 @@ The goal is to help organizations improve mailing strategy by targeting donors w
 - Evaluated models using AUC, sensitivity, and specificity
 - Simulated marketing strategies to optimize donor mailing costs
 
+## Full Project Report
+
+You can view the full analysis here:
+
+📄 [Open HTML Report](report/donor_retention_report.html)
+
+or download the PDF version:
+
+📄 [Download PDF Report](report/donor_retention_report.pdf)
+
 ## Skills Demonstrated
 
 - Machine Learning
