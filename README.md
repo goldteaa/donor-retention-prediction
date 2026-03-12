@@ -1,13 +1,28 @@
 # Donor Retention Prediction
 
-Author: Artea Myftiu  
-Course: Predictive Analytics & Big Data
-
 ## Project Overview
 
 This project uses machine learning in R to predict whether a donor will donate again in 2018.
 
 The goal is to help organizations improve mailing strategy by targeting donors with the highest probability of responding, instead of mailing everyone.
+
+## Project Highlights
+
+- Built an end-to-end machine learning pipeline in R
+- Engineered RFM features from donor history
+- Compared multiple models including logistic regression, random forest, and XGBoost
+- Evaluated models using AUC, sensitivity, and specificity
+- Simulated marketing strategies to optimize donor mailing costs
+
+## Skills Demonstrated
+
+- Machine Learning
+- Predictive Modeling
+- Feature Engineering
+- Model Evaluation
+- R Programming
+- Data Analysis
+- Business Analytics
 
 ## Models Used
 
