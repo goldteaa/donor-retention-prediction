@@ -81,11 +81,11 @@ The results demonstrate how predictive modeling can improve fundraising campaign
 
 A detailed analysis including exploratory data analysis, modeling steps, and evaluation results can be found in the project report.
 
-📄 **HTML Version**
-report/donor_retention_report.html
+📄 **HTML Version**  
+[Open HTML Report](report/donor_retention_report.html)
 
-📄 **PDF Version**
-report/donor_retention_report.pdf
+📄 **PDF Version**  
+[Download PDF Report](report/donor_retention_report.pdf)
 
 ---
 
