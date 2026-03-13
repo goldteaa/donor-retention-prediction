@@ -1,70 +1,124 @@
-# Donor Retention Prediction
+# Donor Retention Prediction using Machine Learning
 
 ## Project Overview
 
-This project uses machine learning in R to predict whether a donor will donate again in 2018.
+This project applies machine learning techniques to predict whether a donor will donate again in the following year.
 
-The goal is to help organizations improve mailing strategy by targeting donors with the highest probability of responding, instead of mailing everyone.
+The goal is to help organizations improve fundraising efficiency by targeting donors with the highest probability of responding instead of sending marketing campaigns to the entire donor base.
 
-## Project Highlights
+---
 
-- Built an end-to-end machine learning pipeline in R
-- Engineered RFM features from donor history
-- Compared multiple models including logistic regression, random forest, and XGBoost
-- Evaluated models using AUC, sensitivity, and specificity
-- Simulated marketing strategies to optimize donor mailing costs
+## Objective
+
+Nonprofit organizations often spend significant resources on fundraising campaigns.
+This project aims to develop a predictive model that identifies donors most likely to respond to future donation requests, allowing organizations to optimize their mailing strategies and reduce unnecessary costs.
+
+---
+
+## Dataset
+
+The dataset contains historical donor information including donation frequency, recency, and monetary value.
+
+Key attributes include:
+
+* Recency of last donation
+* Frequency of donations
+* Monetary value of donations
+* Historical donor activity
+
+Feature engineering techniques were applied to create **RFM (Recency, Frequency, Monetary) variables** commonly used in marketing analytics.
+
+---
+
+## Tools & Technologies
+
+* R
+* tidyverse
+* tidymodels
+* ranger
+* xgboost
+* pROC
+* R Markdown
+
+---
+
+## Methodology
+
+1. Data Cleaning and Preparation
+2. Feature Engineering using RFM variables
+3. Train/Test Data Split
+4. Model Training and Comparison
+5. Model Evaluation using classification metrics
+6. Marketing strategy simulation
+
+Machine learning models evaluated:
+
+* Logistic Regression
+* Stepwise Logistic Regression
+* Decision Tree
+* Tuned Decision Tree
+* Bagged Trees
+* Random Forest
+* Gradient Boosting (XGBoost)
+
+---
+
+## Results
+
+Models were evaluated using the following metrics:
+
+* AUC
+* Sensitivity
+* Specificity
+
+The **Stepwise Logistic Regression** model achieved the best performance with an **AUC of 0.693**.
+
+The results demonstrate how predictive modeling can improve fundraising campaign efficiency by identifying high-probability donors.
+
+---
 
 ## Full Project Report
 
-You can view the full analysis here:
+A detailed analysis including exploratory data analysis, modeling steps, and evaluation results can be found in the project report.
 
-📄 [Open HTML Report](report/donor_retention_report.html)
+📄 **HTML Version**
+report/donor_retention_report.html
 
-or download the PDF version:
+📄 **PDF Version**
+report/donor_retention_report.pdf
 
-📄 [Download PDF Report](report/donor_retention_report.pdf)
-
-## Skills Demonstrated
-
-- Machine Learning
-- Predictive Modeling
-- Feature Engineering
-- Model Evaluation
-- R Programming
-- Data Analysis
-- Business Analytics
-
-## Models Used
-
-- Logistic Regression
-- Stepwise Logistic Regression
-- Decision Tree
-- Tuned Decision Tree
-- Bagged Trees
-- Random Forest
-- Gradient Boosting (XGBoost)
-
-## Evaluation Metrics
-
-- AUC
-- Sensitivity
-- Specificity
-
-## Key Result
-
-The best-performing model was the stepwise logistic regression model, with an AUC of 0.693.
+---
 
 ## Project Structure
 
-- `data/` → raw and engineered datasets
-- `code/` → R Markdown and R code
-- `report/` → final HTML and PDF reports
+```
+donor-retention-prediction
+│
+├── data
+├── code
+├── report
+├── README.md
+```
 
-## Tools Used
+---
 
-- R
-- tidyverse
-- tidymodels
-- ranger
-- xgboost
-- pROC
+## How to Run
+
+1. Clone the repository
+
+```
+git clone https://github.com/goldteaa/donor-retention-prediction.git
+```
+
+2. Open the R Markdown file in RStudio
+
+3. Run the analysis to reproduce the results.
+
+---
+
+## Future Improvements
+
+* Hyperparameter tuning for tree-based models
+* Cross-validation for more robust evaluation
+* Model interpretability using SHAP values
+* Deployment as a donor targeting decision tool
